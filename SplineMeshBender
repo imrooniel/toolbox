@@ -1,0 +1,289 @@
+using UnityEngine;
+using UnityEngine.Splines;
+using Unity.Mathematics;
+using System.Collections.Generic;
+using System.Linq;
+
+[RequireComponent(typeof(MeshFilter), typeof(MeshRenderer))]
+[ExecuteAlways]
+public class SplineMeshBender : MonoBehaviour
+{
+    [Header("Spline Settings")]
+    [SerializeField] SplineContainer m_Container;
+    
+    [Header("Mesh Settings")]
+    [SerializeField] Mesh m_SectionMesh;
+    
+    [Header("Mesh Orientation")]
+    [SerializeField] Vector3 m_MeshForward = Vector3.forward;
+    [SerializeField] Vector3 m_MeshUp = Vector3.up;
+    
+    [Header("Vertex Welding")]
+    [SerializeField] float m_WeldDistance = 0.001f;
+    
+    [Header("Adaptive Density")]
+    [SerializeField] bool m_UseAdaptiveDensity = true;
+    [SerializeField] float m_CurvatureThreshold = 0.1f;
+    [SerializeField] int m_MaxSubdivisions = 4;
+    
+    [Header("Advanced")]
+    [SerializeField] bool m_RebuildOnSplineChange = true;
+    [SerializeField] int m_RebuildFrequency = 30;
+    
+    MeshFilter m_MeshFilter;
+    Mesh m_GeneratedMesh;
+    float m_NextScheduledRebuild;
+    bool m_RebuildRequested;
+
+    public SplineContainer Container
+    {
+        get => m_Container;
+        set => m_Container = value;
+    }
+
+    public Spline Spline => m_Container?.Spline;
+
+    void Reset()
+    {
+        TryGetComponent(out m_Container);
+        SetDefaultMaterial();
+        Rebuild();
+    }
+
+    void OnEnable()
+    {
+        m_MeshFilter = GetComponent<MeshFilter>();
+        EnsureMeshExists();
+        
+        if (Spline != null)
+            Spline.Changed += OnSplineChanged;
+        
+        if (!IsContainerValid())
+            Rebuild();
+    }
+
+    void OnDisable()
+    {
+        if (Spline != null)
+            Spline.Changed -= OnSplineChanged;
+        
+        CleanupMesh();
+    }
+
+    void OnSplineChanged(Spline spline, int knotIndex, SplineModification modificationType)
+    {
+        if (m_RebuildOnSplineChange && m_Container != null && m_Container.Splines.Contains(spline))
+            m_RebuildRequested = true;
+    }
+
+    void Update()
+    {
+        if (m_RebuildRequested && Time.time >= m_NextScheduledRebuild)
+            Rebuild();
+    }
+
+    void SetDefaultMaterial()
+    {
+        if (TryGetComponent<MeshRenderer>(out var renderer) && renderer.sharedMaterial == null)
+        {
+            var cube = GameObject.CreatePrimitive(PrimitiveType.Cube);
+            renderer.sharedMaterial = cube.GetComponent<MeshRenderer>().sharedMaterial;
+            DestroyImmediate(cube);
+        }
+    }
+
+    void EnsureMeshExists()
+    {
+        if (m_GeneratedMesh == null)
+            m_GeneratedMesh = new Mesh { name = "Spline Bent Mesh", hideFlags = HideFlags.HideAndDontSave };
+
+        if (m_MeshFilter == null)
+            m_MeshFilter = GetComponent<MeshFilter>();
+
+        if (m_MeshFilter != null)
+        {
+            m_MeshFilter.hideFlags = HideFlags.NotEditable;
+            m_MeshFilter.sharedMesh = m_GeneratedMesh;
+        }
+    }
+
+    void CleanupMesh()
+    {
+        if (m_MeshFilter != null)
+        {
+            m_MeshFilter.hideFlags = HideFlags.None;
+            m_MeshFilter.sharedMesh = null;
+        }
+
+        if (m_GeneratedMesh != null)
+        {
+#if UNITY_EDITOR
+            if (!UnityEditor.EditorUtility.IsPersistent(m_GeneratedMesh))
+                DestroyImmediate(m_GeneratedMesh, true);
+#else
+            DestroyImmediate(m_GeneratedMesh);
+#endif
+            m_GeneratedMesh = null;
+        }
+    }
+
+    bool IsContainerValid()
+    {
+        return m_Container != null && m_Container.Spline != null && m_Container.Splines.Count > 0;
+    }
+
+    [ContextMenu("Rebuild")]
+    public void Rebuild()
+    {
+        if (!IsContainerValid() || m_GeneratedMesh == null)
+        {
+            if (Application.isPlaying && m_GeneratedMesh != null)
+                Debug.LogError("SplineMeshBender: Invalid SplineContainer", this);
+            return;
+        }
+
+        if (m_SectionMesh == null)
+        {
+            Debug.LogError("SplineMeshBender: Section Mesh not assigned", this);
+            return;
+        }
+
+        m_GeneratedMesh.Clear();
+
+        var spline = m_Container.Spline;
+        var splineLength = spline.GetLength();
+        var localForward = m_MeshForward.normalized;
+        var meshLength = CalculateMeshLength(m_SectionMesh.bounds, localForward);
+        var totalSegments = Mathf.Max(1, Mathf.CeilToInt(splineLength / meshLength));
+
+        var srcVertices = m_SectionMesh.vertices;
+        var srcTriangles = m_SectionMesh.triangles;
+        var srcNormals = m_SectionMesh.normals;
+        var srcUVs = m_SectionMesh.uv;
+        var vertexDistances = CalculateVertexDistances(srcVertices, m_SectionMesh.bounds.min, localForward);
+
+        var vertices = new List<Vector3>();
+        var normals = new List<Vector3>();
+        var uvs = new List<Vector2>();
+        var triangles = new List<int>();
+
+        BendMeshAlongSpline(spline, splineLength, totalSegments, meshLength, srcVertices, srcNormals, 
+                           srcUVs, srcTriangles, vertexDistances, localForward, vertices, normals, uvs, triangles);
+
+        ApplyMeshData(vertices, triangles, normals, uvs);
+
+        m_NextScheduledRebuild = Time.time + 1f / m_RebuildFrequency;
+        m_RebuildRequested = false;
+    }
+
+    float CalculateMeshLength(Bounds bounds, Vector3 forward)
+    {
+        return Vector3.Dot(bounds.size, new Vector3(Mathf.Abs(forward.x), Mathf.Abs(forward.y), Mathf.Abs(forward.z)));
+    }
+
+    float[] CalculateVertexDistances(Vector3[] vertices, Vector3 boundsMin, Vector3 forward)
+    {
+        var distances = new float[vertices.Length];
+        for (int i = 0; i < vertices.Length; i++)
+            distances[i] = Vector3.Dot(vertices[i] - boundsMin, forward);
+        return distances;
+    }
+
+    void BendMeshAlongSpline(Spline spline, float splineLength, int totalSegments, float meshLength,
+                            Vector3[] srcVertices, Vector3[] srcNormals, Vector2[] srcUVs, int[] srcTriangles,
+                            float[] vertexDistances, Vector3 localForward,
+                            List<Vector3> vertices, List<Vector3> normals, List<Vector2> uvs, List<int> triangles)
+    {
+        var meshAdjustment = Quaternion.Inverse(Quaternion.LookRotation(m_MeshForward, m_MeshUp));
+        var previousSegmentStartIndex = -1;
+        var previousSegmentEndIndex = -1;
+
+        for (int seg = 0; seg < totalSegments; seg++)
+        {
+            int baseVertex = vertices.Count;
+            var vertexIndexMapping = new int[srcVertices.Length];
+
+            for (int v = 0; v < srcVertices.Length; v++)
+            {
+                var segmentT = (float)seg / totalSegments;
+                var vertexOffsetInMeshUnits = vertexDistances[v] / meshLength;
+                var vertexOffsetInSplineUnits = vertexOffsetInMeshUnits * meshLength / splineLength;
+                var t = Mathf.Clamp01(segmentT + vertexOffsetInSplineUnits);
+
+                spline.Evaluate(t, out float3 position, out float3 tangent, out float3 up);
+
+                var rotation = Quaternion.LookRotation(tangent, up) * meshAdjustment;
+                var vertexCrossSection = srcVertices[v] - localForward * vertexDistances[v];
+                var newVertexPos = (Vector3)position + rotation * vertexCrossSection;
+
+                int weldedIndex = -1;
+                if (seg > 0 && m_WeldDistance > 0 && previousSegmentStartIndex >= 0)
+                {
+                    for (int prevIdx = previousSegmentStartIndex; prevIdx <= previousSegmentEndIndex; prevIdx++)
+                    {
+                        if (Vector3.Distance(newVertexPos, vertices[prevIdx]) < m_WeldDistance)
+                        {
+                            weldedIndex = prevIdx;
+                            break;
+                        }
+                    }
+                }
+
+                if (weldedIndex >= 0)
+                {
+                    vertexIndexMapping[v] = weldedIndex;
+                }
+                else
+                {
+                    vertexIndexMapping[v] = vertices.Count;
+                    vertices.Add(newVertexPos);
+                    normals.Add(rotation * srcNormals[v]);
+                    if (srcUVs.Length > 0)
+                        uvs.Add(srcUVs[v]);
+                }
+            }
+
+            for (int t = 0; t < srcTriangles.Length; t++)
+                triangles.Add(vertexIndexMapping[srcTriangles[t]]);
+
+            previousSegmentStartIndex = baseVertex;
+            previousSegmentEndIndex = vertices.Count - 1;
+        }
+    }
+
+    void ApplyMeshData(List<Vector3> vertices, List<int> triangles, List<Vector3> normals, List<Vector2> uvs)
+    {
+        m_GeneratedMesh.SetVertices(vertices);
+        m_GeneratedMesh.SetTriangles(triangles, 0);
+        m_GeneratedMesh.SetNormals(normals);
+        if (uvs.Count > 0)
+            m_GeneratedMesh.SetUVs(0, uvs);
+        m_GeneratedMesh.RecalculateBounds();
+    }
+
+#if UNITY_EDITOR
+    void OnValidate()
+    {
+        if (!UnityEditor.EditorApplication.isPlaying)
+            Rebuild();
+    }
+#endif
+
+    void OnDrawGizmosSelected()
+    {
+        if (!IsContainerValid() || m_SectionMesh == null) return;
+
+        Gizmos.color = Color.yellow;
+        var spline = m_Container.Spline;
+        var splineLength = spline.GetLength();
+        var meshLength = CalculateMeshLength(m_SectionMesh.bounds, m_MeshForward.normalized);
+        var totalSegments = Mathf.Max(1, Mathf.CeilToInt(splineLength / meshLength));
+
+        for (int i = 0; i <= totalSegments; i += Mathf.Max(1, totalSegments / 20))
+        {
+            var t = (float)i / totalSegments;
+            spline.Evaluate(t, out float3 pos, out _, out _);
+            Gizmos.DrawWireSphere(m_Container.transform.TransformPoint(pos), 0.05f);
+        }
+    }
+}
