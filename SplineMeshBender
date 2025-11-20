@@ -176,6 +176,38 @@ public class SplineMeshBender : MonoBehaviour
         m_RebuildRequested = false;
     }
 
+#if UNITY_EDITOR
+    [ContextMenu("Save Mesh as Asset")]
+    public void SaveMeshAsAsset()
+    {
+        if (m_GeneratedMesh == null || m_GeneratedMesh.vertexCount == 0)
+        {
+            Debug.LogError("SplineMeshBender: No mesh to save. Please rebuild first.", this);
+            return;
+        }
+
+        string path = UnityEditor.EditorUtility.SaveFilePanelInProject(
+            "Save Mesh Asset",
+            gameObject.name + "_SplineMesh",
+            "asset",
+            "Please enter a file name to save the mesh");
+
+        if (string.IsNullOrEmpty(path))
+            return;
+
+        Mesh meshCopy = Instantiate(m_GeneratedMesh);
+        meshCopy.name = System.IO.Path.GetFileNameWithoutExtension(path);
+
+        UnityEditor.AssetDatabase.CreateAsset(meshCopy, path);
+        UnityEditor.AssetDatabase.SaveAssets();
+        UnityEditor.AssetDatabase.Refresh();
+
+        UnityEditor.EditorGUIUtility.PingObject(meshCopy);
+
+        Debug.Log($"Mesh saved successfully to: {path}", this);
+    }
+#endif
+
     float CalculateMeshLength(Bounds bounds, Vector3 forward)
     {
         return Vector3.Dot(bounds.size, new Vector3(Mathf.Abs(forward.x), Mathf.Abs(forward.y), Mathf.Abs(forward.z)));
@@ -201,7 +233,6 @@ public class SplineMeshBender : MonoBehaviour
         for (int seg = 0; seg < totalSegments; seg++)
         {
             int baseVertex = vertices.Count;
-            var vertexIndexMapping = new int[srcVertices.Length];
 
             for (int v = 0; v < srcVertices.Length; v++)
             {
@@ -216,35 +247,35 @@ public class SplineMeshBender : MonoBehaviour
                 var vertexCrossSection = srcVertices[v] - localForward * vertexDistances[v];
                 var newVertexPos = (Vector3)position + rotation * vertexCrossSection;
 
-                int weldedIndex = -1;
                 if (seg > 0 && m_WeldDistance > 0 && previousSegmentStartIndex >= 0)
                 {
+                    float closestDistance = float.MaxValue;
+                    int closestIndex = -1;
+                    
                     for (int prevIdx = previousSegmentStartIndex; prevIdx <= previousSegmentEndIndex; prevIdx++)
                     {
-                        if (Vector3.Distance(newVertexPos, vertices[prevIdx]) < m_WeldDistance)
+                        float distance = Vector3.Distance(newVertexPos, vertices[prevIdx]);
+                        if (distance < closestDistance && distance < m_WeldDistance)
                         {
-                            weldedIndex = prevIdx;
-                            break;
+                            closestDistance = distance;
+                            closestIndex = prevIdx;
                         }
+                    }
+
+                    if (closestIndex >= 0)
+                    {
+                        newVertexPos = vertices[closestIndex];
                     }
                 }
 
-                if (weldedIndex >= 0)
-                {
-                    vertexIndexMapping[v] = weldedIndex;
-                }
-                else
-                {
-                    vertexIndexMapping[v] = vertices.Count;
-                    vertices.Add(newVertexPos);
-                    normals.Add(rotation * srcNormals[v]);
-                    if (srcUVs.Length > 0)
-                        uvs.Add(srcUVs[v]);
-                }
+                vertices.Add(newVertexPos);
+                normals.Add(rotation * srcNormals[v]);
+                if (srcUVs.Length > 0)
+                    uvs.Add(srcUVs[v]);
             }
 
             for (int t = 0; t < srcTriangles.Length; t++)
-                triangles.Add(vertexIndexMapping[srcTriangles[t]]);
+                triangles.Add(baseVertex + srcTriangles[t]);
 
             previousSegmentStartIndex = baseVertex;
             previousSegmentEndIndex = vertices.Count - 1;
